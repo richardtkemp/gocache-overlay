@@ -197,9 +197,9 @@ func mustOK(t *testing.T, r runResult) {
 	}
 }
 
-func fingerprint(t *testing.T, dir string) treehash.Sum {
+func fingerprint(t *testing.T, dir string, skip ...string) treehash.Sum {
 	t.Helper()
-	s, err := treehash.Of(dir)
+	s, err := treehash.Of(dir, skip...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,5 +420,62 @@ func TestGOCACHEMustCoverShared(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err == nil || !strings.Contains(string(out), "is not a prefix of the shared dir") {
 		t.Fatalf("want refusal, got err=%v\n%s", err, out)
+	}
+}
+
+// A scratch root inside the shared dir, beside the 00-ff entry dirs (the
+// factory's <GOCACHE>/overlay): a run's outputs persist across go commands
+// there, the shared entries stay byte-for-byte unchanged, and -remove-id
+// deletes the run dir. A root that is the shared dir or lies under an entry
+// dir is refused.
+func TestRootInsideShared(t *testing.T) {
+	shared := filepath.Join(t.TempDir(), "shared")
+	if out, err := exec.Command("cp", "-a", seedCache, shared).CombinedOutput(); err != nil {
+		t.Fatalf("copying the seeded cache: %v\n%s", err, out)
+	}
+	// Created first: making it changes the shared dir's own mtime, once.
+	root := filepath.Join(shared, "overlay")
+	if err := os.Mkdir(root, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	before := fingerprint(t, shared, "overlay")
+	dir := module(t, "func Mutant() int { return 11 }")
+	id := []string{"-id", "run-inside"}
+	r1 := goOverlay(t, dir, shared, root, id, "test", "./...")
+	mustOK(t, r1)
+	r2 := goOverlay(t, dir, shared, root, id, "test", "./...")
+	mustOK(t, r2)
+	t.Logf("first: %+v\nsecond: %+v", r1.stats, r2.stats)
+	if r1.stats.SharedHits == 0 || r1.stats.Puts == 0 {
+		t.Fatalf("first run: want shared hits and puts, got %+v", r1.stats)
+	}
+	if r2.stats.ScratchHits == 0 || r2.stats.Puts != 0 {
+		t.Fatalf("second run should be served from the run dir + shared: %+v", r2.stats)
+	}
+	runDir := overlay.RunDir(root, "run-inside")
+	if !strings.HasPrefix(runDir, shared+"/overlay/") {
+		t.Fatalf("run dir %s is not under %s/overlay", runDir, shared)
+	}
+	if after := fingerprint(t, shared, "overlay"); after != before {
+		t.Errorf("shared entries changed:\nbefore %v\nafter  %v", before, after)
+	}
+	if out, err := exec.Command(helperBin, "-root", root, "-remove-id", "run-inside").CombinedOutput(); err != nil {
+		t.Fatalf("-remove-id: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
+		t.Fatalf("run dir still present after -remove-id: %v", err)
+	}
+
+	for _, bad := range []string{filepath.Join(shared, "ab"), filepath.Join(shared, "ab", "x")} {
+		r := goOverlay(t, module(t, ""), shared, bad, nil, "build", "./...")
+		if r.err == nil || !strings.Contains(r.output, "must not be under one of the 00-ff entry dirs") {
+			t.Errorf("root %s: want refusal, got err=%v\n%s", bad, r.err, r.output)
+		}
+	}
+	for _, bad := range []string{shared, filepath.Dir(shared)} {
+		r := goOverlay(t, module(t, ""), shared, bad, nil, "build", "./...")
+		if r.err == nil || !strings.Contains(r.output, "must not contain the shared dir") {
+			t.Errorf("root %s: want refusal, got err=%v\n%s", bad, r.err, r.output)
+		}
 	}
 }

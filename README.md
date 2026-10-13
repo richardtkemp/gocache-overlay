@@ -92,7 +92,7 @@ with an environment variable, which the go command passes on to the helper.
 | flag | env | default | meaning |
 |---|---|---|---|
 | `-shared` | `GOCACHE_OVERLAY_SHARED` | `$GOCACHE` | the native cache to read |
-| `-root` | `GOCACHE_OVERLAY_ROOT` | `$TMPDIR/gocache-overlay-<uid>` | where scratch dirs go; must not overlap the shared dir |
+| `-root` | `GOCACHE_OVERLAY_ROOT` | `$TMPDIR/gocache-overlay-<uid>` | where scratch dirs go; must not contain the shared dir; may be inside it, beside the `00`–`ff` dirs |
 | `-id` | `GOCACHE_OVERLAY_ID` | none | run id (`[A-Za-z0-9._-]`, up to 128 characters) |
 | `-max-age` | `GOCACHE_OVERLAY_MAX_AGE` | `24h` | sweep scratch dirs older than this; `0` turns the sweep off |
 | `-stats` | `GOCACHE_OVERLAY_STATS` | none | append one JSON line of counters per helper process |
@@ -112,7 +112,17 @@ Stats line: `{"gets":…,"scratch_hits":…,"shared_hits":…,"misses":…,"puts
   default `-shared` follows it. The go command itself writes nothing new
   there: the `00`–`ff` subdirs and the `README` already exist, and while
   `GOCACHEPROG` is in use it neither trims nor updates mtimes.
-- **The scratch root must not overlap the shared dir**, in either direction.
+- **The scratch root must not contain the shared dir.** It may sit INSIDE
+  the shared dir, beside the entry dirs (for example `$GOCACHE/overlay`), but
+  not be the shared dir itself or lie under one of its `00`–`ff` entry dirs.
+  The helper reads only those, and go's trim and `go clean -cache` touch only
+  those, so a root beside them is invisible to all three. Inside `GOCACHE` is
+  the better place for a long-lived run dir: the go command copies scratch
+  files it installs instead of renaming them out of the scratch dir, and a
+  sandbox that lets go write `GOCACHE` (foci's Landlock seal) already lets the
+  helper write there. A cron that deletes old files under `GOCACHE` by age
+  also reaches the scratch files; the run dirs themselves go by `-remove-id`
+  and the sweep.
 
 ## A Go upgrade that changes the cache format
 

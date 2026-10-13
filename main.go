@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -38,6 +39,9 @@ Scratch dirs live under the scratch root:
   with a run id:    <root>/run-<id>, shared by every go command carrying the
                     id, removed by 'gocache-overlay -remove-id <id>'
 Every start also removes scratch dirs untouched for longer than -max-age.
+The root may be a subdir of the shared dir (not a 00-ff entry dir), e.g.
+$GOCACHE/overlay: go then copies the scratch files it installs, and whatever
+lets go write GOCACHE (a sandbox) lets the helper write its scratch.
 
 GOCACHE_OVERLAY_DEBUG=1 logs every get and put to stderr.
 
@@ -184,10 +188,32 @@ func checkDirs(shared, root, gocache string) (string, error) {
 	if gocache != "" && !strings.HasPrefix(shared, gocache) {
 		return "", fmt.Errorf("GOCACHE=%s is not a prefix of the shared dir %s; the go command could move shared files away. Set GOCACHE to the shared dir", gocache, shared)
 	}
-	if within(root, shared) || within(shared, root) {
-		return "", fmt.Errorf("scratch root %s and shared dir %s must not contain each other", root, shared)
+	if within(shared, root) {
+		return "", fmt.Errorf("scratch root %s must not contain the shared dir %s", root, shared)
+	}
+	if within(root, shared) {
+		// Inside the shared dir is allowed, beside the native entries: the go
+		// command then copies (never renames) scratch files it installs, and a
+		// seal that lets go write GOCACHE lets the helper write its scratch.
+		// Not under a 00-ff entry dir: the shared reads, go's trim and
+		// `go clean -cache` all own those.
+		first, _, _ := strings.Cut(filepath.ToSlash(mustRel(shared, root)), "/")
+		if nativeSubdir.MatchString(first) {
+			return "", fmt.Errorf("scratch root %s must not be under one of the 00-ff entry dirs of the shared dir %s", root, shared)
+		}
 	}
 	return shared, nil
+}
+
+// nativeSubdir names the native cache's entry dirs (<GOCACHE>/00 ... /ff).
+var nativeSubdir = regexp.MustCompile(`^[0-9a-f]{2}$`)
+
+func mustRel(dir, path string) string {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return path
+	}
+	return rel
 }
 
 func within(path, dir string) bool {

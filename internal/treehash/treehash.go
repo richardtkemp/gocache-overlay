@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 )
 
 // Sum is a fingerprint plus counts, for readable failures.
@@ -23,13 +24,17 @@ func (s Sum) String() string {
 	return fmt.Sprintf("%d files, %d bytes, %s", s.Files, s.Bytes, s.Hash[:16])
 }
 
-// Of fingerprints dir.
-func Of(dir string) (Sum, error) {
+// Of fingerprints dir, leaving out the subtrees named by skip (paths
+// relative to dir).
+func Of(dir string, skip ...string) (Sum, error) {
 	h := sha256.New()
 	var s Sum
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if rel, _ := filepath.Rel(dir, path); d.IsDir() && slices.Contains(skip, rel) {
+			return filepath.SkipDir
 		}
 		fi, err := d.Info()
 		if err != nil {
