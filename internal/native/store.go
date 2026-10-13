@@ -13,6 +13,24 @@ import (
 // and concurrent readers only ever see absent or complete files.
 type Store struct {
 	Cache
+	// Perm is the mode of written files; 0 means 0644. Plain mode (writing the
+	// shared cache itself) uses what the go command would: 0666 less umask.
+	Perm os.FileMode
+}
+
+// MtimeInterval mirrors cmd/go/internal/cache: an entry's mtime is refreshed
+// on use when it is older than this, so mtime-based trimming (go's own, or a
+// cron) sees which entries are still in use.
+const MtimeInterval = time.Hour
+
+// MarkUsed refreshes the mtimes of actionID's entry file and its output file
+// (outputPath, as Get returned it) the way the go command does on a hit.
+func (s Store) MarkUsed(actionID []byte, outputPath string, now time.Time) {
+	for _, f := range []string{s.fileName(actionID, "a"), outputPath} {
+		if fi, err := os.Stat(f); err == nil && now.Sub(fi.ModTime()) >= MtimeInterval {
+			_ = os.Chtimes(f, now, now)
+		}
+	}
 }
 
 // Put stores body as the output for actionID and returns the body's path.
@@ -25,18 +43,25 @@ func (s Store) Put(actionID, outputID, body []byte, now time.Time) (string, erro
 	// Bodies are content-addressed: if a complete one is already there
 	// (another writer, or an earlier put), keep it.
 	if fi, err := os.Stat(dpath); err != nil || !fi.Mode().IsRegular() || fi.Size() != int64(len(body)) {
-		if err := atomicWrite(dpath, body); err != nil {
+		if err := atomicWrite(dpath, body, s.perm()); err != nil {
 			return "", err
 		}
 	}
 	line := fmt.Sprintf("v1 %x %x %20d %20d\n", actionID, outputID, len(body), now.UnixNano())
-	if err := atomicWrite(s.fileName(actionID, "a"), []byte(line)); err != nil {
+	if err := atomicWrite(s.fileName(actionID, "a"), []byte(line), s.perm()); err != nil {
 		return "", err
 	}
 	return dpath, nil
 }
 
-func atomicWrite(path string, data []byte) error {
+func (s Store) perm() os.FileMode {
+	if s.Perm == 0 {
+		return 0o644
+	}
+	return s.Perm
+}
+
+func atomicWrite(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o777); err != nil {
 		return err
@@ -52,8 +77,8 @@ func atomicWrite(path string, data []byte) error {
 	}
 	if err == nil {
 		// CreateTemp makes 0600 files; make them readable like the native
-		// cache's (0666 before umask).
-		err = os.Chmod(tmp, 0o644)
+		// cache's.
+		err = os.Chmod(tmp, perm)
 	}
 	if err == nil {
 		err = os.Rename(tmp, path)

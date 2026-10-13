@@ -53,7 +53,7 @@ func TestParseEntry(t *testing.T) {
 
 func TestStorePutGetAndExecutableDir(t *testing.T) {
 	dir := t.TempDir()
-	s := Store{Cache{Dir: dir}}
+	s := Store{Cache: Cache{Dir: dir}}
 	body := []byte("hello")
 	out := sha256.Sum256(body)
 	path, err := s.Put(id("x"), out[:], body, time.Now())
@@ -97,7 +97,7 @@ func TestStorePutGetAndExecutableDir(t *testing.T) {
 
 func TestProbe(t *testing.T) {
 	dir := t.TempDir()
-	s := Store{Cache{Dir: dir}}
+	s := Store{Cache: Cache{Dir: dir}}
 	if n, err := s.Probe(16); n != 0 || err != nil {
 		t.Fatalf("empty: %d %v", n, err)
 	}
@@ -172,7 +172,7 @@ func TestConcurrentWriters(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s := Store{Cache{Dir: dir}}
+			s := Store{Cache: Cache{Dir: dir}}
 			for r := range rounds {
 				for k := range keys {
 					k := (k + w + r) % keys

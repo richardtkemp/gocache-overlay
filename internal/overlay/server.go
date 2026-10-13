@@ -50,9 +50,16 @@ type Stats struct {
 }
 
 // Server answers one go command's requests.
+//
+// Overlay mode: Shared is read only and Scratch is a separate dir. Plain mode
+// (Scratch over the Shared dir itself): it reads and writes the shared cache
+// as the go command would without a helper, marking entries used as go does.
 type Server struct {
 	Shared  native.Cache // read only
 	Scratch native.Store // all writes land here
+	// OnMiss, if set, runs before the answer to every miss and put; an error
+	// stops the server (the build fails). The lazy lock hangs here.
+	OnMiss func() error
 	// Touch, if set, is called (at most once a minute) after a put, so a
 	// long-lived run dir is not taken for abandoned by the age sweep.
 	Touch func()
@@ -113,7 +120,7 @@ func (s *Server) Serve(in io.Reader, out io.Writer) error {
 		case "get":
 			res, fatal = s.get(&req)
 		case "put":
-			res = s.put(&req, body)
+			res, fatal = s.put(&req, body)
 		case "close":
 			return send(&response{ID: req.ID})
 		default:
@@ -136,18 +143,26 @@ func (s *Server) count(f func(*Stats)) {
 
 func (s *Server) get(req *request) (*response, error) {
 	s.count(func(st *Stats) { st.Gets++ })
-	// Scratch first: it holds this run's own outputs.
+	// Scratch first: it holds this run's own outputs. In plain mode it is the
+	// shared dir, read once as the shared cache.
 	for _, src := range []struct {
-		c   native.Cache
-		hit func(*Stats)
+		c    native.Cache
+		hit  func(*Stats)
+		skip bool
 	}{
-		{s.Scratch.Cache, func(st *Stats) { st.ScratchHits++ }},
-		{s.Shared, func(st *Stats) { st.SharedHits++ }},
+		{s.Scratch.Cache, func(st *Stats) { st.ScratchHits++ }, s.plain()},
+		{s.Shared, func(st *Stats) { st.SharedHits++ }, false},
 	} {
+		if src.skip {
+			continue
+		}
 		e, path, err := src.c.Get(req.ActionID)
 		if err == nil {
 			s.count(src.hit)
 			s.debugf("get %x hit %s", req.ActionID, path)
+			if s.plain() {
+				s.Scratch.MarkUsed(req.ActionID, path, time.Now())
+			}
 			t := e.Time
 			return &response{ID: req.ID, OutputID: e.OutputID[:], Size: e.Size, Time: &t, DiskPath: path}, nil
 		}
@@ -157,10 +172,31 @@ func (s *Server) get(req *request) (*response, error) {
 	}
 	s.count(func(st *Stats) { st.Misses++ })
 	s.debugf("get %x miss", req.ActionID)
+	if err := s.needLock(); err != nil {
+		return nil, err
+	}
 	return &response{ID: req.ID, Miss: true}, nil
 }
 
-func (s *Server) put(req *request, body []byte) *response {
+// plain reports plain mode: the scratch store is the shared dir.
+func (s *Server) plain() bool { return s.Scratch.Dir == s.Shared.Dir }
+
+func (s *Server) needLock() error {
+	if s.OnMiss == nil {
+		return nil
+	}
+	return s.OnMiss()
+}
+
+func (s *Server) put(req *request, body []byte) (*response, error) {
+	// A put follows a miss, so the lock is normally held already.
+	if err := s.needLock(); err != nil {
+		return nil, err
+	}
+	return s.store(req, body), nil
+}
+
+func (s *Server) store(req *request, body []byte) *response {
 	if sum := sha256.Sum256(body); !bytes.Equal(sum[:], req.OutputID) {
 		return &response{ID: req.ID, Err: fmt.Sprintf("put: OutputID %x is not the SHA-256 of the body", req.OutputID)}
 	}

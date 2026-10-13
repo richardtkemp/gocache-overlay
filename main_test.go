@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/richardtkemp/gocache-overlay/internal/lock"
 	"github.com/richardtkemp/gocache-overlay/internal/native"
 	"github.com/richardtkemp/gocache-overlay/internal/overlay"
 	"github.com/richardtkemp/gocache-overlay/internal/treehash"
@@ -162,18 +163,41 @@ type runResult struct {
 	stats  overlay.Stats
 	output string
 	err    error
+	lock   []string // each helper process's lock state, in stats-line order
+}
+
+func readLockStates(statsFile string) []string {
+	data, _ := os.ReadFile(statsFile)
+	var states []string
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	for sc.Scan() {
+		var line struct {
+			Lock string `json:"lock"`
+		}
+		if json.Unmarshal(sc.Bytes(), &line) == nil {
+			states = append(states, line.Lock)
+		}
+	}
+	return states
 }
 
 // goOverlay runs a go command with the helper over shared.
 func goOverlay(t *testing.T, dir, shared, root string, helperArgs []string, args ...string) runResult {
 	t.Helper()
+	return goOverlayEnv(t, dir, shared, root, helperArgs, nil, args...)
+}
+
+// goOverlayEnv is goOverlay with extra environment for the go command.
+func goOverlayEnv(t *testing.T, dir, shared, root string, helperArgs, extraEnv []string, args ...string) runResult {
+	t.Helper()
 	statsFile := filepath.Join(t.TempDir(), "stats.jsonl")
 	prog := strings.Join(append([]string{helperBin, "-root", root, "-stats", statsFile}, helperArgs...), " ")
 	cmd := exec.Command("go", args...)
 	cmd.Dir = dir
-	cmd.Env = goEnv(shared, prog)
+	cmd.Env = append(goEnv(shared, prog), extraEnv...)
 	out, err := cmd.CombinedOutput()
 	r := runResult{output: string(out), err: err}
+	r.lock = readLockStates(statsFile)
 	data, _ := os.ReadFile(statsFile)
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	for sc.Scan() { // one line per helper process; sum them
@@ -477,5 +501,222 @@ func TestRootInsideShared(t *testing.T) {
 		if r.err == nil || !strings.Contains(r.output, "must not contain the shared dir") {
 			t.Errorf("root %s: want refusal, got err=%v\n%s", bad, r.err, r.output)
 		}
+	}
+}
+
+// ---- lazy lock (-lock) and plain mode (-mode plain), #2396 ----
+
+// holdLock holds an flock on path from a separate process (not an ancestor of
+// the go commands the test runs) until the test ends or release is called.
+func holdLock(t *testing.T, path string) (release func()) {
+	t.Helper()
+	cmd := exec.Command("flock", "-o", path, "-c", "echo locked; exec sleep 60") // -o: only flock itself holds it
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	line, _ := bufio.NewReader(stdout).ReadString('\n')
+	if line != "locked\n" {
+		t.Fatalf("flock holder did not report the lock: %q", line)
+	}
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			cmd.Process.Kill()
+			cmd.Wait()
+		})
+	}
+	t.Cleanup(release)
+	return release
+}
+
+func lockFile(t *testing.T) string {
+	p := filepath.Join(t.TempDir(), "heavy")
+	if err := os.WriteFile(p, nil, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// plainCache is a private copy of the seeded cache, for plain mode (which writes it).
+func plainCache(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "shared")
+	if out, err := exec.Command("cp", "-a", seedCache, dir).CombinedOutput(); err != nil {
+		t.Fatalf("copying the seeded cache: %v\n%s", err, out)
+	}
+	return dir
+}
+
+// A go command the cache fully covers never takes the lock, so it runs while
+// another process holds it.
+func TestLockNotNeededWhenFullyCached(t *testing.T) {
+	lk := lockFile(t)
+	holdLock(t, lk)
+	for _, mode := range []string{"overlay", "plain"} {
+		r := goOverlay(t, modSrc, seedCache, t.TempDir(), []string{"-mode", mode, "-lock", lk}, "build", "./lib")
+		mustOK(t, r)
+		if r.stats.Misses != 0 || len(r.lock) != 1 || r.lock[0] != "not needed" {
+			t.Errorf("%s: fully cached build: want no miss and lock %q, got %+v lock %q", mode, "not needed", r.stats, r.lock)
+		}
+	}
+}
+
+// The first miss waits for the lock and holds it: the build does not finish
+// while another process holds the lock, and finishes once it is released.
+func TestLockTakenOnFirstMiss(t *testing.T) {
+	lk := lockFile(t)
+	release := holdLock(t, lk)
+	done := make(chan runResult, 1)
+	dir := module(t, "func Mutant() int { return 21 }")
+	go func() {
+		done <- goOverlay(t, dir, seedCache, t.TempDir(), []string{"-lock", lk}, "build", "./...")
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("build with a miss finished while the lock was held elsewhere: %+v lock %q\n%s", r.stats, r.lock, r.output)
+	case <-time.After(3 * time.Second):
+	}
+	release()
+	r := <-done
+	mustOK(t, r)
+	if r.stats.Misses == 0 || len(r.lock) != 1 || !strings.HasPrefix(r.lock[0], "taken after waiting ") {
+		t.Errorf("want a miss and the lock taken after waiting, got %+v lock %q", r.stats, r.lock)
+	}
+}
+
+// A caller that holds the lock up front says so in $HEAVY_LOCK_HELD; the
+// helper then does not wait for it (it would wait on its own caller).
+func TestLockHeldByCaller(t *testing.T) {
+	lk := lockFile(t)
+	holdLock(t, lk)
+	r := goOverlayEnv(t, module(t, "func Mutant() int { return 22 }"), seedCache, t.TempDir(), []string{"-lock", lk},
+		[]string{lock.HeldEnv + "=/other:" + lk}, "build", "./...")
+	mustOK(t, r)
+	if r.stats.Misses == 0 || len(r.lock) != 1 || r.lock[0] != "held by caller ($HEAVY_LOCK_HELD)" {
+		t.Errorf("want a miss and the lock held by the caller, got %+v lock %q", r.stats, r.lock)
+	}
+}
+
+// The lock file is opened read-only and never created; a missing one fails
+// the build instead of running unlocked.
+func TestLockFileMissingFailsTheBuild(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such-lock")
+	r := goOverlay(t, module(t, "func Mutant() int { return 23 }"), seedCache, t.TempDir(), []string{"-lock", missing},
+		"build", "./...")
+	if r.err == nil || !strings.Contains(r.output, "lock: open "+missing) {
+		t.Fatalf("want a failed build naming the lock file, got err=%v\n%s", r.err, r.output)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Errorf("the lock file was created: %v", err)
+	}
+}
+
+const nestTest = `package nest
+
+import (
+	"os"
+	"os/exec"
+	"testing"
+)
+
+// A test that runs a go build, as foci's tests do (testharness, cmd/foci).
+func TestNestedBuild(t *testing.T) {
+	cmd := exec.Command("go", "build", "./...")
+	cmd.Dir = os.Getenv("NEST_DIR")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("nested go build: %v\n%s", err, out)
+	}
+}
+`
+
+// A go command run by a test, while the test's own go command's helper holds
+// the lock, must not wait for it: the holder waits for the test.
+func TestNestedGoBuildDoesNotDeadlock(t *testing.T) {
+	// Under another name, as an install may be: the helpers recognise each other by their own name.
+	renamed := filepath.Join(t.TempDir(), "gco")
+	if out, err := exec.Command("cp", helperBin, renamed).CombinedOutput(); err != nil {
+		t.Fatalf("copy helper: %v\n%s", err, out)
+	}
+	defer func(b string) { helperBin = b }(helperBin)
+	helperBin = renamed
+	lk := lockFile(t)
+	nest := t.TempDir()
+	os.WriteFile(filepath.Join(nest, "go.mod"), []byte("module example.com/nest\n\ngo 1.24\n"), 0o644)
+	os.WriteFile(filepath.Join(nest, "nest_test.go"), []byte(nestTest), 0o644)
+	inner := module(t, "func Mutant() int { return 24 }") // misses: the nested helper needs the lock too
+	r := goOverlayEnv(t, nest, seedCache, t.TempDir(), []string{"-lock", lk}, []string{"NEST_DIR=" + inner},
+		"test", "-count=1", "-timeout=60s", "./...")
+	mustOK(t, r)
+	t.Logf("lock states: %q", r.lock)
+	var outer, nested int
+	for _, st := range r.lock {
+		switch {
+		case st == "taken":
+			outer++
+		case strings.HasPrefix(st, "held by ") && strings.Contains(st, ", the helper of ancestor "):
+			nested++
+		}
+	}
+	if outer != 1 || nested != 1 {
+		t.Errorf("want the outer helper to take the lock and the nested one to see it held by it, got %q", r.lock)
+	}
+}
+
+// Plain mode reads and writes the shared cache like the go command itself: a
+// mutant's outputs land in the shared dir, a second build hits them there, no
+// scratch dir is made, and a hit on an entry older than an hour refreshes its
+// mtimes (so mtime-based trimming sees it as in use).
+func TestPlainModeWritesTheSharedCache(t *testing.T) {
+	shared := plainCache(t)
+	root := t.TempDir()
+	dir := module(t, "func Mutant() int { return 25 }")
+	plain := []string{"-mode", "plain"}
+	r1 := goOverlay(t, dir, shared, root, plain, "build", "./lib")
+	mustOK(t, r1)
+	if r1.stats.Puts == 0 || r1.stats.ScratchHits != 0 {
+		t.Fatalf("first plain build: want puts, got %+v", r1.stats)
+	}
+	if left := scratchDirs(t, root); len(left) != 0 {
+		t.Errorf("plain mode made scratch dirs: %v", left)
+	}
+	// Age every file, then hit them again.
+	old := time.Now().Add(-2 * time.Hour)
+	filepath.WalkDir(shared, func(p string, d fs.DirEntry, _ error) error {
+		if d != nil && !d.IsDir() {
+			os.Chtimes(p, old, old)
+		}
+		return nil
+	})
+	r2 := goOverlay(t, dir, shared, root, plain, "build", "./lib")
+	mustOK(t, r2)
+	if r2.stats.Misses != 0 || r2.stats.Puts != 0 || r2.stats.SharedHits == 0 {
+		t.Fatalf("second plain build: want only shared hits, got %+v", r2.stats)
+	}
+	fresh := 0
+	filepath.WalkDir(shared, func(p string, d fs.DirEntry, _ error) error {
+		if d != nil && !d.IsDir() {
+			if fi, err := d.Info(); err == nil && time.Since(fi.ModTime()) < time.Hour {
+				fresh++
+			}
+		}
+		return nil
+	})
+	if fresh < int(r2.stats.SharedHits) {
+		t.Errorf("hits did not refresh mtimes: %d fresh files for %d hits", fresh, r2.stats.SharedHits)
+	}
+	// A native go command reads what plain mode wrote.
+	cmd := exec.Command("go", "build", "./lib")
+	cmd.Dir = dir
+	cmd.Env = goEnv(shared, "")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("native build over the plain-mode cache: %v\n%s", err, out)
+	}
+}
+
+func TestModeMustBeKnown(t *testing.T) {
+	r := goOverlay(t, module(t, ""), seedCache, t.TempDir(), []string{"-mode", "weird"}, "build", "./...")
+	if r.err == nil || !strings.Contains(r.output, `-mode "weird": want overlay or plain`) {
+		t.Fatalf("want refusal, got err=%v\n%s", r.err, r.output)
 	}
 }

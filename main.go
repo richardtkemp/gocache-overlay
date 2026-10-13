@@ -2,7 +2,9 @@
 // build cache and never writes to it. New build outputs go to a scratch
 // directory that is thrown away, so mutation testing (thousands of builds
 // whose outputs are never reused) gets cache hits for unchanged packages
-// without growing GOCACHE.
+// without growing GOCACHE. -mode plain drops the overlay (it reads and writes
+// GOCACHE like the go command), and -lock takes a host build lock only on the
+// first cache miss.
 //
 // Usage: GOCACHEPROG=gocache-overlay go test ./...   (see README.md, or -h)
 package main
@@ -20,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/richardtkemp/gocache-overlay/internal/lock"
 	"github.com/richardtkemp/gocache-overlay/internal/native"
 	"github.com/richardtkemp/gocache-overlay/internal/overlay"
 )
@@ -42,6 +45,18 @@ Every start also removes scratch dirs untouched for longer than -max-age.
 The root may be a subdir of the shared dir (not a 00-ff entry dir), e.g.
 $GOCACHE/overlay: go then copies the scratch files it installs, and whatever
 lets go write GOCACHE (a sandbox) lets the helper write its scratch.
+
+-mode plain reads AND writes the shared cache, as the go command does
+without a helper (no scratch; hits refresh mtimes as go does): for -lock
+without the overlay.
+
+-lock <file> takes an flock on that file at the first cache miss, before
+answering it, and holds it until exit: a go command the cache fully covers
+never waits for a host-wide build lock. It does not wait when the process tree
+already holds the lock: $HEAVY_LOCK_HELD names the file (a caller locked up
+front), or /proc/locks shows an ancestor, or this program serving an ancestor
+go command (a go build run by a test), holding it. The file is opened read-only
+and never created; failing to open or lock it fails the build.
 
 GOCACHE_OVERLAY_DEBUG=1 logs every get and put to stderr.
 
@@ -91,6 +106,10 @@ func run() int {
 	verbose := fl.Bool("v", os.Getenv("GOCACHE_OVERLAY_VERBOSE") != "",
 		"print a stats line to stderr at exit ($GOCACHE_OVERLAY_VERBOSE)")
 	removeID := fl.String("remove-id", "", "remove the scratch dir of this run id, then exit (no protocol)")
+	mode := fl.String("mode", envOr("GOCACHE_OVERLAY_MODE", "overlay"),
+		"overlay: read the shared cache, write scratch; plain: read and write the shared cache ($GOCACHE_OVERLAY_MODE)")
+	lockPath := fl.String("lock", os.Getenv("GOCACHE_OVERLAY_LOCK"),
+		"flock this file (opened read-only, never created) on the first cache miss and hold it until exit ($GOCACHE_OVERLAY_LOCK)")
 	if err := fl.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -112,13 +131,39 @@ func run() int {
 		return 0
 	}
 
-	sharedDir, err := checkDirs(*shared, *root, os.Getenv("GOCACHE"))
+	if *mode != "overlay" && *mode != "plain" {
+		return fatal("-mode %q: want overlay or plain", *mode)
+	}
+	plain := *mode == "plain"
+	if *lockPath != "" && !filepath.IsAbs(*lockPath) {
+		return fatal("-lock %q must be an absolute path", *lockPath)
+	}
+	var lazy *lock.Lazy
+	if *lockPath != "" {
+		lazy = &lock.Lazy{Path: *lockPath}
+	}
+
+	var sharedDir string
+	var err error
+	if plain {
+		sharedDir, err = checkShared(*shared, os.Getenv("GOCACHE"))
+	} else {
+		sharedDir, err = checkDirs(*shared, *root, os.Getenv("GOCACHE"))
+	}
 	if err != nil {
 		return fatal("%v", err)
 	}
 	sharedCache := native.Cache{Dir: sharedDir}
 	if _, err := sharedCache.Probe(16); err != nil {
 		return fatal("%v", err)
+	}
+
+	if plain {
+		srv := &overlay.Server{
+			Shared:  sharedCache,
+			Scratch: native.Store{Cache: sharedCache, Perm: 0o666 &^ umask()},
+		}
+		return serve(srv, lazy, *statsFile, *verbose, sharedDir, "", fatal)
 	}
 
 	scratchDir, ephemeral, err := overlay.OpenScratch(*root, *id)
@@ -149,18 +194,42 @@ func run() int {
 		Shared:  sharedCache,
 		Scratch: native.Store{Cache: native.Cache{Dir: scratchDir}},
 	}
-	if os.Getenv("GOCACHE_OVERLAY_DEBUG") != "" {
-		srv.Debug = os.Stderr
-	}
 	if !ephemeral {
 		srv.Touch = func() { _ = os.Chtimes(scratchDir, time.Now(), time.Now()) }
 	}
+	return serve(srv, lazy, *statsFile, *verbose, sharedDir, scratchDir, fatal)
+}
+
+// serve runs the protocol, with the lazy lock (if any) taken on the first
+// miss, and writes the stats line.
+func serve(srv *overlay.Server, lazy *lock.Lazy, statsFile string, verbose bool, shared, scratch string,
+	fatal func(string, ...any) int) int {
+	if os.Getenv("GOCACHE_OVERLAY_DEBUG") != "" {
+		srv.Debug = os.Stderr
+	}
+	if lazy != nil {
+		srv.OnMiss = lazy.Need
+	}
 	serveErr := srv.Serve(os.Stdin, os.Stdout)
-	report(srv.Stats(), *statsFile, *verbose, sharedDir, scratchDir)
+	lockState := ""
+	if lazy != nil {
+		lockState = lazy.State()
+		if lockState == "" {
+			lockState = "not needed"
+		}
+	}
+	report(srv.Stats(), statsFile, verbose, shared, scratch, lockState)
 	if serveErr != nil {
 		return fatal("%v", serveErr)
 	}
 	return 0
+}
+
+// umask returns the process umask (the go command's own files use 0666 less it).
+func umask() os.FileMode {
+	m := syscall.Umask(0)
+	syscall.Umask(m)
+	return os.FileMode(m)
 }
 
 // checkDirs validates the shared dir and scratch root and returns the
@@ -171,23 +240,14 @@ func run() int {
 // installs from the cache (cmd/go/internal/work.moveOrCopyFile). A shared
 // file outside GOCACHE could be moved out of the shared cache.
 func checkDirs(shared, root, gocache string) (string, error) {
-	if shared == "" {
-		return "", errors.New("no shared cache dir: set GOCACHE or -shared")
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("scratch root %q must be absolute", root)
 	}
-	if !filepath.IsAbs(shared) || !filepath.IsAbs(root) {
-		return "", fmt.Errorf("shared dir %q and scratch root %q must be absolute", shared, root)
-	}
-	shared, root = filepath.Clean(shared), filepath.Clean(root)
-	fi, err := os.Stat(shared)
+	shared, err := checkShared(shared, gocache)
 	if err != nil {
-		return "", fmt.Errorf("shared cache: %v", err)
+		return "", err
 	}
-	if !fi.IsDir() {
-		return "", fmt.Errorf("shared cache %s is not a directory", shared)
-	}
-	if gocache != "" && !strings.HasPrefix(shared, gocache) {
-		return "", fmt.Errorf("GOCACHE=%s is not a prefix of the shared dir %s; the go command could move shared files away. Set GOCACHE to the shared dir", gocache, shared)
-	}
+	root = filepath.Clean(root)
 	if within(shared, root) {
 		return "", fmt.Errorf("scratch root %s must not contain the shared dir %s", root, shared)
 	}
@@ -201,6 +261,28 @@ func checkDirs(shared, root, gocache string) (string, error) {
 		if nativeSubdir.MatchString(first) {
 			return "", fmt.Errorf("scratch root %s must not be under one of the 00-ff entry dirs of the shared dir %s", root, shared)
 		}
+	}
+	return shared, nil
+}
+
+// checkShared validates the shared dir (both modes) and returns it cleaned.
+func checkShared(shared, gocache string) (string, error) {
+	if shared == "" {
+		return "", errors.New("no shared cache dir: set GOCACHE or -shared")
+	}
+	if !filepath.IsAbs(shared) {
+		return "", fmt.Errorf("shared dir %q must be absolute", shared)
+	}
+	shared = filepath.Clean(shared)
+	fi, err := os.Stat(shared)
+	if err != nil {
+		return "", fmt.Errorf("shared cache: %v", err)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("shared cache %s is not a directory", shared)
+	}
+	if gocache != "" && !strings.HasPrefix(shared, gocache) {
+		return "", fmt.Errorf("GOCACHE=%s is not a prefix of the shared dir %s; the go command could move shared files away. Set GOCACHE to the shared dir", gocache, shared)
 	}
 	return shared, nil
 }
@@ -221,14 +303,15 @@ func within(path, dir string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
 }
 
-func report(st overlay.Stats, statsFile string, verbose bool, shared, scratch string) {
+func report(st overlay.Stats, statsFile string, verbose bool, shared, scratch, lockState string) {
 	line := struct {
 		overlay.Stats
 		PID     int    `json:"pid"`
 		Shared  string `json:"shared"`
-		Scratch string `json:"scratch"`
+		Scratch string `json:"scratch,omitempty"`
+		Lock    string `json:"lock,omitempty"`
 		Time    string `json:"time"`
-	}{st, os.Getpid(), shared, scratch, time.Now().UTC().Format(time.RFC3339)}
+	}{st, os.Getpid(), shared, scratch, lockState, time.Now().UTC().Format(time.RFC3339)}
 	b, _ := json.Marshal(line)
 	if verbose {
 		fmt.Fprintf(os.Stderr, "gocache-overlay: %s\n", b)

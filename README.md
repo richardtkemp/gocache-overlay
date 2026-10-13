@@ -99,8 +99,40 @@ with an environment variable, which the go command passes on to the helper.
 | `-v` | `GOCACHE_OVERLAY_VERBOSE` | off | print that line to stderr |
 | | `GOCACHE_OVERLAY_DEBUG` | off | log every get and put to stderr |
 | `-remove-id ID` | | | delete `<root>/run-ID`, print the bytes it held, and exit |
+| `-mode` | `GOCACHE_OVERLAY_MODE` | `overlay` | `plain`: read and write the shared cache like the go command itself (no scratch) |
+| `-lock FILE` | `GOCACHE_OVERLAY_LOCK` | none | flock FILE on the first cache miss and hold it until exit (see below) |
 
 Stats line: `{"gets":…,"scratch_hits":…,"shared_hits":…,"misses":…,"puts":…,"put_bytes":…}`.
+
+### A lazy build lock (`-lock`)
+
+A host that serialises heavy builds with one flock (foci's `/tmp/heavy`) makes
+every go command wait in that queue, even one the cache fully covers. With
+`-lock FILE` the helper takes the lock at the first cache **miss**, before it
+answers that miss, and holds it until it exits (the go command's end). A go
+command with no miss never touches the lock; one with a miss is serialised as
+before.
+
+- The file is opened read-only and never created (a sandbox may allow only
+  reading it; a missing lock file is a setup error). Failing to open or lock it
+  fails the build: it never runs unlocked.
+- It does not wait on a lock its own process tree holds, which would deadlock:
+  - `$HEAVY_LOCK_HELD` (colon-separated paths) names the file: a caller that
+    took the lock up front says so to everything it starts;
+  - the holder in `/proc/locks` is an ancestor of the helper;
+  - the holder is another process of this program (same `/proc/<pid>/comm`)
+    whose parent is an ancestor: a go command run by a test (a nested
+    `go build`) while the test's own go command's helper holds the lock.
+- It cannot tell a `go test -count=N` run (whose tests always run, so a fully
+  cached compile means no miss and no lock) from a cached one. Such a caller
+  must take the lock up front and set `$HEAVY_LOCK_HELD`.
+- The stats line's `lock` field says what happened: `not needed`, `taken`,
+  `taken after waiting <d>`, or `held by ...`.
+
+`-mode plain` is the same helper without the overlay: gets and puts go to the
+shared cache, as with no helper at all, and a hit refreshes the entry's mtimes
+the way the go command does (so mtime-based trimming still sees it in use).
+Files are written with the go command's mode (0666 less umask).
 
 ### Rules it enforces
 
