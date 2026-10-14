@@ -12,6 +12,12 @@
 //     front (for example around a go test -count=1 run, which the cache cannot
 //     cover) says so for everything it starts;
 //   - the holder recorded in /proc/locks is an ancestor of this process;
+//   - an ancestor holds the lock through one of its open files: its
+//     /proc/<pid>/fdinfo/<fd> for an fd on the lock file has a "lock:" line.
+//     /proc/locks names the process that called flock, which is not always
+//     the one holding it: in `( flock 9; go build 9<&- ) 9<lockfile` the
+//     flock(1) child takes the lock and exits, and the lock stays with the
+//     subshell's fd 9, so /proc/locks names a dead pid (#2418);
 //   - the holder is another process of this program (same /proc/<pid>/comm)
 //     whose parent is an ancestor of this process: a go command run by a test that its own go command's
 //     helper is holding the lock for (a nested `go build` in a test).
@@ -140,7 +146,8 @@ func heldByLineage(f *os.File) string {
 		return ""
 	}
 	anc := ancestors(os.Getpid())
-	for _, h := range holders(st.Dev, st.Ino) {
+	id := fileID(st.Dev, st.Ino)
+	for _, h := range holders(id) {
 		if slices.Contains(anc, h) {
 			return fmt.Sprintf("held by ancestor %d", h)
 		}
@@ -151,26 +158,69 @@ func heldByLineage(f *os.File) string {
 			}
 		}
 	}
+	for _, a := range anc {
+		if fd := lockedFD(a, st.Dev, st.Ino, id); fd >= 0 {
+			return fmt.Sprintf("held by ancestor %d through its fd %d", a, fd)
+		}
+	}
 	return ""
 }
 
+// fileID is a file as /proc/locks and fdinfo "lock:" lines print it: the
+// device as %02x:%02x (major:minor) and the inode in decimal.
+func fileID(dev, ino uint64) string {
+	return fmt.Sprintf("%02x:%02x:%d", major(dev), minor(dev), ino)
+}
+
+// lockedFD returns an fd of pid that is open on the file (dev, ino) and holds
+// an flock on it, else -1. The kernel lists, in /proc/<pid>/fdinfo/<fd>, the
+// locks held through that fd's open file description, whichever process took
+// them. Processes this one may not inspect (another user's) are skipped.
+func lockedFD(pid int, dev, ino uint64, id string) int {
+	dir := "/proc/" + strconv.Itoa(pid)
+	ents, err := os.ReadDir(dir + "/fd")
+	if err != nil {
+		return -1
+	}
+	for _, e := range ents {
+		fd, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		var st syscall.Stat_t
+		if syscall.Stat(dir+"/fd/"+e.Name(), &st) != nil || st.Dev != dev || st.Ino != ino {
+			continue
+		}
+		b, err := os.ReadFile(dir + "/fdinfo/" + e.Name())
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			// "lock:\t1: FLOCK  ADVISORY  WRITE 1234 08:05:16911388 0 EOF"; a
+			// waiter would have "->" before FLOCK.
+			f := strings.Fields(line)
+			if len(f) >= 7 && f[0] == "lock:" && f[2] == "FLOCK" && f[6] == id {
+				return fd
+			}
+		}
+	}
+	return -1
+}
+
 // holders lists the pids /proc/locks records as holding an flock on the file
-// (dev, ino). Waiters ("->" lines) are left out.
-func holders(dev, ino uint64) []int {
+// id (see fileID). Waiters ("->" lines) are left out.
+func holders(id string) []int {
 	f, err := os.Open("/proc/locks")
 	if err != nil {
 		return nil
 	}
 	defer f.Close()
-	// The kernel prints the device as %02x:%02x (major:minor) and the inode in
-	// decimal.
-	want := fmt.Sprintf("%02x:%02x:%d", major(dev), minor(dev), ino)
 	var pids []int
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
 		// "1: FLOCK  ADVISORY  WRITE 1234 08:05:16911388 0 EOF"
-		if len(fields) < 6 || fields[1] != "FLOCK" || fields[5] != want {
+		if len(fields) < 6 || fields[1] != "FLOCK" || fields[5] != id {
 			continue
 		}
 		if pid, err := strconv.Atoi(fields[4]); err == nil {

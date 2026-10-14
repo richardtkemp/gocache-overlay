@@ -54,8 +54,10 @@ without the overlay.
 answering it, and holds it until exit: a go command the cache fully covers
 never waits for a host-wide build lock. It does not wait when the process tree
 already holds the lock: $HEAVY_LOCK_HELD names the file (a caller locked up
-front), or /proc/locks shows an ancestor, or this program serving an ancestor
-go command (a go build run by a test), holding it. The file is opened read-only
+front), or /proc/locks shows an ancestor, or an ancestor holds it through an
+open file (/proc/<pid>/fdinfo, as with "( flock 9; go build 9<&- ) 9<file"),
+or this program serving an ancestor go command (a go build run by a test)
+holds it. The file is opened read-only
 and never created; failing to open or lock it fails the build. When it takes
 the lock it prints ">>> waiting for heavy lock ... [HH:MM:SS]" and
 ">>> acquired heavy lock [HH:MM:SS]" to stderr, which the go command passes

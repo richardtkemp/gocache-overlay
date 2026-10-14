@@ -668,6 +668,24 @@ func TestLockHeldByAncestor(t *testing.T) {
 	wantNoLockLines(t, r)
 }
 
+// The build-script pattern `( flock 9; go build 9<&- ) 9<lockfile` (foci's
+// Makefile): the flock(1) child takes the lock and exits, so /proc/locks names
+// a dead pid and the lock lives on the subshell's fd. The helper must see
+// that ancestor's fd holding it and not wait: waiting deadlocks (#2418), which
+// timeout turns into a failed build here. The command after go keeps the
+// shell from exec'ing it (an exec with 9<&- would drop the lock).
+func TestLockHeldThroughAncestorShellFd(t *testing.T) {
+	lk := lockFile(t)
+	wrap := []string{"timeout", "-k", "5", "120", "sh", "-c", `( flock 9; "$@" 9<&-; s=$?; exit $s ) 9<"$0"`, lk}
+	r := goOverlayWrapped(t, wrap, module(t, "func Mutant() int { return 28 }"), seedCache, t.TempDir(),
+		[]string{"-lock", lk}, []string{lock.HeldEnv + "="}, "build", "./...")
+	mustOK(t, r)
+	if r.stats.Misses == 0 || len(r.lock) != 1 || !regexp.MustCompile(`^held by ancestor \d+ through its fd \d+$`).MatchString(r.lock[0]) {
+		t.Errorf("want a miss and the lock held through the ancestor subshell's fd, got %+v lock %q", r.stats, r.lock)
+	}
+	wantNoLockLines(t, r)
+}
+
 // A caller that holds the lock up front says so in $HEAVY_LOCK_HELD; the
 // helper then does not wait for it (it would wait on its own caller).
 func TestLockHeldByCaller(t *testing.T) {

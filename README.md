@@ -120,6 +120,11 @@ before.
   - `$HEAVY_LOCK_HELD` (colon-separated paths) names the file: a caller that
     took the lock up front says so to everything it starts;
   - the holder in `/proc/locks` is an ancestor of the helper;
+  - an ancestor holds it through one of its open files (a `lock:` line in
+    `/proc/<pid>/fdinfo/<fd>` for an fd on the file). `/proc/locks` names the
+    process that called flock, not the one keeping the lock: in
+    `( flock 9; go build 9<&- ) 9<lockfile` the flock(1) child exits and the
+    lock stays with the subshell's fd 9;
   - the holder is another process of this program (same `/proc/<pid>/comm`)
     whose parent is an ancestor: a go command run by a test (a nested
     `go build`) while the test's own go command's helper holds the lock.
