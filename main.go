@@ -56,7 +56,10 @@ never waits for a host-wide build lock. It does not wait when the process tree
 already holds the lock: $HEAVY_LOCK_HELD names the file (a caller locked up
 front), or /proc/locks shows an ancestor, or this program serving an ancestor
 go command (a go build run by a test), holding it. The file is opened read-only
-and never created; failing to open or lock it fails the build.
+and never created; failing to open or lock it fails the build. When it takes
+the lock it prints ">>> waiting for heavy lock ... [HH:MM:SS]" and
+">>> acquired heavy lock [HH:MM:SS]" to stderr, which the go command passes
+through as its own; it prints nothing when it does not take the lock.
 
 GOCACHE_OVERLAY_DEBUG=1 logs every get and put to stderr.
 
@@ -140,7 +143,7 @@ func run() int {
 	}
 	var lazy *lock.Lazy
 	if *lockPath != "" {
-		lazy = &lock.Lazy{Path: *lockPath}
+		lazy = &lock.Lazy{Path: *lockPath, Log: os.Stderr}
 	}
 
 	var sharedDir string

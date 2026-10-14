@@ -15,12 +15,19 @@
 //   - the holder is another process of this program (same /proc/<pid>/comm)
 //     whose parent is an ancestor of this process: a go command run by a test that its own go command's
 //     helper is holding the lock for (a nested `go build` in a test).
+//
+// When it does take the lock it prints the same two lines a build script
+// around flock prints (">>> waiting for heavy lock ... [HH:MM:SS]" before
+// blocking, ">>> acquired heavy lock [HH:MM:SS]" after), so whatever reads a
+// build's output for lock waits sees these too. It prints nothing when it does
+// not take the lock.
 package lock
 
 import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -38,6 +45,10 @@ const HeldEnv = "HEAVY_LOCK_HELD"
 // Lazy is a lock taken at most once, on the first call to Need.
 type Lazy struct {
 	Path string
+	// Log, if set, gets the waiting and acquired lines when this process
+	// takes the lock (the go command passes the helper's stderr through as
+	// its own).
+	Log io.Writer
 
 	once  sync.Once
 	err   error
@@ -71,6 +82,10 @@ func (l *Lazy) acquire() (string, error) {
 	fd := int(f.Fd())
 	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
 		l.f = f
+		// Not blocked, but the pair still marks the take, as a script's
+		// unconditional echo-flock-echo does.
+		l.say(waitingLine)
+		l.say(acquiredLine)
 		return "taken", nil
 	} else if !errors.Is(err, syscall.EWOULDBLOCK) {
 		f.Close()
@@ -80,13 +95,32 @@ func (l *Lazy) acquire() (string, error) {
 		f.Close()
 		return who, nil
 	}
+	l.say(waitingLine)
 	start := time.Now()
 	if err := flockRetry(fd); err != nil {
 		f.Close()
 		return "", fmt.Errorf("lock %s: %w", l.Path, err)
 	}
 	l.f = f
+	l.say(acquiredLine)
 	return fmt.Sprintf("taken after waiting %s", time.Since(start).Round(time.Millisecond)), nil
+}
+
+// The lines a build prints around taking the lock: lock-wait readers (the
+// factory's timeline charts) match ">>> waiting for heavy lock" and
+// ">>> acquired heavy lock", each followed by the first "[HH:MM:SS]" (local
+// time). The stamp comes before the path so a '[' in the path cannot shadow it.
+const (
+	waitingLine  = ">>> waiting for heavy lock ... [%s] (gocache-overlay: %s; another build may be running)\n"
+	acquiredLine = ">>> acquired heavy lock [%s] (gocache-overlay: %s)\n"
+)
+
+// say prints one of the lines above as a single write, so it is not split by
+// the go command's own output on the same stderr.
+func (l *Lazy) say(format string) {
+	if l.Log != nil {
+		fmt.Fprintf(l.Log, format, time.Now().Format(time.TimeOnly), l.Path)
+	}
 }
 
 func flockRetry(fd int) error {

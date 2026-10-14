@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -190,9 +191,17 @@ func goOverlay(t *testing.T, dir, shared, root string, helperArgs []string, args
 // goOverlayEnv is goOverlay with extra environment for the go command.
 func goOverlayEnv(t *testing.T, dir, shared, root string, helperArgs, extraEnv []string, args ...string) runResult {
 	t.Helper()
+	return goOverlayWrapped(t, nil, dir, shared, root, helperArgs, extraEnv, args...)
+}
+
+// goOverlayWrapped is goOverlayEnv with the go command run under wrap (a
+// command prefix such as flock FILE), or directly when wrap is empty.
+func goOverlayWrapped(t *testing.T, wrap []string, dir, shared, root string, helperArgs, extraEnv []string, args ...string) runResult {
+	t.Helper()
 	statsFile := filepath.Join(t.TempDir(), "stats.jsonl")
 	prog := strings.Join(append([]string{helperBin, "-root", root, "-stats", statsFile}, helperArgs...), " ")
-	cmd := exec.Command("go", args...)
+	argv := append(append(append([]string{}, wrap...), "go"), args...)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = append(goEnv(shared, prog), extraEnv...)
 	out, err := cmd.CombinedOutput()
@@ -530,6 +539,40 @@ func holdLock(t *testing.T, path string) (release func()) {
 	return release
 }
 
+// The factory's lock-wait readers, as they match a build's output lines: a
+// line starting ">>>" (foci-factory scripts/run-timeline.py) and the regexes
+// of temporal-factory factory/steps.py, which need a [HH:MM:SS] stamp.
+var (
+	waitLineRE = regexp.MustCompile(`(?i)waiting for (?:the )?(?:remote )?heavy(?: build)? lock[^\[]*\[(\d\d:\d\d:\d\d)\]`)
+	gotLineRE  = regexp.MustCompile(`(?i)acquired (?:the )?(?:remote )?heavy(?: build)? lock[^\[]*\[(\d\d:\d\d:\d\d)\]`)
+)
+
+// lockLines returns, in order, "w" for each waiting line and "g" for each
+// acquired line in a go command's output that both readers would take.
+func lockLines(output string) string {
+	var seq string
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.HasPrefix(strings.TrimLeft(line, " \t"), ">>>") {
+			continue
+		}
+		switch {
+		case waitLineRE.MatchString(line):
+			seq += "w"
+		case gotLineRE.MatchString(line):
+			seq += "g"
+		}
+	}
+	return seq
+}
+
+// wantNoLockLines fails if the helper printed lock lines although it did not take the lock.
+func wantNoLockLines(t *testing.T, r runResult) {
+	t.Helper()
+	if seq := lockLines(r.output); seq != "" || strings.Contains(r.output, "heavy lock") {
+		t.Errorf("lock not taken, but lock lines (%q) were printed:\n%s", seq, r.output)
+	}
+}
+
 func lockFile(t *testing.T) string {
 	p := filepath.Join(t.TempDir(), "heavy")
 	if err := os.WriteFile(p, nil, 0o444); err != nil {
@@ -559,6 +602,7 @@ func TestLockNotNeededWhenFullyCached(t *testing.T) {
 		if r.stats.Misses != 0 || len(r.lock) != 1 || r.lock[0] != "not needed" {
 			t.Errorf("%s: fully cached build: want no miss and lock %q, got %+v lock %q", mode, "not needed", r.stats, r.lock)
 		}
+		wantNoLockLines(t, r)
 	}
 }
 
@@ -583,6 +627,45 @@ func TestLockTakenOnFirstMiss(t *testing.T) {
 	if r.stats.Misses == 0 || len(r.lock) != 1 || !strings.HasPrefix(r.lock[0], "taken after waiting ") {
 		t.Errorf("want a miss and the lock taken after waiting, got %+v lock %q", r.stats, r.lock)
 	}
+	// The go command passes the helper's stderr through as its own, so the
+	// build's output carries the pair the factory's lock-wait charts read.
+	if seq := lockLines(r.output); seq != "wg" {
+		t.Errorf("want one waiting line then one acquired line in the build's output, got %q:\n%s", seq, r.output)
+	}
+}
+
+// An uncontended take still prints the pair (a zero-length wait), as a
+// script's echo-flock-echo does.
+func TestLockTakenUncontendedPrintsLines(t *testing.T) {
+	lk := lockFile(t)
+	for _, mode := range []string{"overlay", "plain"} {
+		shared := seedCache
+		if mode == "plain" {
+			shared = plainCache(t)
+		}
+		r := goOverlay(t, module(t, "func Mutant() int { return 26 }"), shared, t.TempDir(),
+			[]string{"-mode", mode, "-lock", lk}, "build", "./...")
+		mustOK(t, r)
+		if len(r.lock) != 1 || r.lock[0] != "taken" {
+			t.Errorf("%s: want the lock taken, got lock %q", mode, r.lock)
+		}
+		if seq := lockLines(r.output); seq != "wg" {
+			t.Errorf("%s: want one waiting line then one acquired line, got %q:\n%s", mode, seq, r.output)
+		}
+	}
+}
+
+// The lock held by an ancestor (in /proc/locks) is not waited for, and no
+// lines are printed.
+func TestLockHeldByAncestor(t *testing.T) {
+	lk := lockFile(t)
+	r := goOverlayWrapped(t, []string{"flock", lk}, module(t, "func Mutant() int { return 27 }"), seedCache, t.TempDir(),
+		[]string{"-lock", lk}, nil, "build", "./...")
+	mustOK(t, r)
+	if r.stats.Misses == 0 || len(r.lock) != 1 || !strings.HasPrefix(r.lock[0], "held by ancestor ") {
+		t.Errorf("want a miss and the lock held by an ancestor, got %+v lock %q", r.stats, r.lock)
+	}
+	wantNoLockLines(t, r)
 }
 
 // A caller that holds the lock up front says so in $HEAVY_LOCK_HELD; the
@@ -596,6 +679,7 @@ func TestLockHeldByCaller(t *testing.T) {
 	if r.stats.Misses == 0 || len(r.lock) != 1 || r.lock[0] != "held by caller ($HEAVY_LOCK_HELD)" {
 		t.Errorf("want a miss and the lock held by the caller, got %+v lock %q", r.stats, r.lock)
 	}
+	wantNoLockLines(t, r)
 }
 
 // The lock file is opened read-only and never created; a missing one fails
@@ -624,9 +708,11 @@ import (
 func TestNestedBuild(t *testing.T) {
 	cmd := exec.Command("go", "build", "./...")
 	cmd.Dir = os.Getenv("NEST_DIR")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("nested go build: %v\n%s", err, out)
 	}
+	t.Logf("nested go build output:\n%s", out) // shown under -v: the nested helper's lock lines, if any
 }
 `
 
@@ -646,9 +732,16 @@ func TestNestedGoBuildDoesNotDeadlock(t *testing.T) {
 	os.WriteFile(filepath.Join(nest, "nest_test.go"), []byte(nestTest), 0o644)
 	inner := module(t, "func Mutant() int { return 24 }") // misses: the nested helper needs the lock too
 	r := goOverlayEnv(t, nest, seedCache, t.TempDir(), []string{"-lock", lk}, []string{"NEST_DIR=" + inner},
-		"test", "-count=1", "-timeout=60s", "./...")
+		"test", "-v", "-count=1", "-timeout=60s", "./...")
 	mustOK(t, r)
 	t.Logf("lock states: %q", r.lock)
+	if !strings.Contains(r.output, "nested go build output:") {
+		t.Fatalf("the nested build's output is not in the test output:\n%s", r.output)
+	}
+	// Only the outer helper, which took the lock, prints the pair.
+	if seq := lockLines(r.output); seq != "wg" {
+		t.Errorf("want only the outer helper's waiting and acquired lines, got %q:\n%s", seq, r.output)
+	}
 	var outer, nested int
 	for _, st := range r.lock {
 		switch {

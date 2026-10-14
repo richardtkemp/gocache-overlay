@@ -128,6 +128,13 @@ before.
   must take the lock up front and set `$HEAVY_LOCK_HELD`.
 - The stats line's `lock` field says what happened: `not needed`, `taken`,
   `taken after waiting <d>`, or `held by ...`.
+- When it takes the lock it prints the lines a build script around `flock`
+  prints, to stderr, which the go command passes through as its own:
+  `>>> waiting for heavy lock ... [HH:MM:SS] (...)` before it blocks and
+  `>>> acquired heavy lock [HH:MM:SS] (...)` once it holds the lock (local
+  time; both at once when nobody else held it). It prints nothing when it does
+  not take the lock (no miss, or one of the cases above). A caller that sends
+  the go command's output to a file finds them there.
 
 `-mode plain` is the same helper without the overlay: gets and puts go to the
 shared cache, as with no helper at all, and a hit refreshes the entry's mtimes

@@ -2,13 +2,19 @@
 
 package lock
 
-import "errors"
+import (
+	"errors"
+	"io"
+)
 
 // HeldEnv: see lock.go.
 const HeldEnv = "HEAVY_LOCK_HELD"
 
 // Lazy is unsupported off Linux: -lock fails the build instead of running unlocked.
-type Lazy struct{ Path string }
+type Lazy struct {
+	Path string
+	Log  io.Writer // unused off Linux
+}
 
 // Need always fails off Linux.
 func (l *Lazy) Need() error { return errors.New("lock: -lock is supported on Linux only") }
