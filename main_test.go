@@ -357,6 +357,51 @@ func TestRunIDSharedAcrossInvocations(t *testing.T) {
 	}
 }
 
+// #2461: -remove-id with a root that holds no dir for the run fails with a
+// message naming the root, instead of printing "removed ... (0 bytes)" and
+// exiting 0. When the run dir exists under a subdir of $GOCACHE (the usual
+// in-cache root, e.g. $GOCACHE/overlay), the message names that root and
+// nothing is removed.
+func TestRemoveIDMissingRunDirFails(t *testing.T) {
+	gocache := t.TempDir()
+	real := filepath.Join(gocache, "overlay", "run-shadow-1")
+	if err := os.MkdirAll(real, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "f"), []byte("12345"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wrong := t.TempDir()
+	env := append(os.Environ(), "GOCACHE="+gocache, "GOCACHE_OVERLAY_ROOT=")
+	cmd := exec.Command(helperBin, "-root", wrong, "-remove-id", "shadow-1")
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("-remove-id on a root without the run dir exited 0\nstdout: %s\nstderr: %s", stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "removed") {
+		t.Errorf("stdout claims a removal: %s", stdout.String())
+	}
+	msg := stderr.String()
+	for _, want := range []string{"no scratch dir", wrong, "-root " + filepath.Join(gocache, "overlay")} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("stderr lacks %q:\n%s", want, msg)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(real, "f")); err != nil {
+		t.Fatalf("the run dir under the other root was touched: %v", err)
+	}
+
+	// With no candidate elsewhere, still a failure naming the root.
+	cmd = exec.Command(helperBin, "-root", wrong, "-remove-id", "nowhere-1")
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), wrong) || strings.Contains(string(out), "-root "+filepath.Join(gocache, "overlay")) {
+		t.Fatalf("missing run dir, no candidate: err %v, output:\n%s", err, out)
+	}
+}
+
 // Requirement 9: several go processes write to one run dir at once. All
 // succeed, and afterwards every one of their builds is a full hit (no torn
 // or missing entries).

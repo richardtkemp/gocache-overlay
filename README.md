@@ -72,6 +72,10 @@ for m in mutants/*; do (cd "$m" && go test ./...); done   # parallel is fine too
 gocache-overlay -remove-id "$WORKFLOW_ID"                 # final cleanup step
 ```
 
+`-remove-id` uses the same root as the run (`-root` / `$GOCACHE_OVERLAY_ROOT`).
+With another root it finds no run dir and exits 1, so a wrong root is not
+reported as a removal.
+
 Several go processes can write to one run dir at the same time. Every write
 is atomic, and a reader sees either a complete entry or no entry.
 
@@ -98,7 +102,7 @@ with an environment variable, which the go command passes on to the helper.
 | `-stats` | `GOCACHE_OVERLAY_STATS` | none | append one JSON line of counters per helper process |
 | `-v` | `GOCACHE_OVERLAY_VERBOSE` | off | print that line to stderr |
 | | `GOCACHE_OVERLAY_DEBUG` | off | log every get and put to stderr |
-| `-remove-id ID` | | | delete `<root>/run-ID`, print the bytes it held, and exit |
+| `-remove-id ID` | | | delete `<root>/run-ID`, print the bytes it held, and exit; if `<root>/run-ID` does not exist, exit 1 and name any `run-ID` dir found under the default root or a subdir of the shared dir (it removes nothing then) |
 | `-mode` | `GOCACHE_OVERLAY_MODE` | `overlay` | `plain`: read and write the shared cache like the go command itself (no scratch) |
 | `-lock FILE` | `GOCACHE_OVERLAY_LOCK` | none | flock FILE on the first cache miss and hold it until exit (see below) |
 

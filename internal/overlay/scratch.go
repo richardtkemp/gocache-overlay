@@ -104,18 +104,58 @@ func Sweep(root string, maxAge time.Duration, keep string) ([]string, error) {
 }
 
 // RemoveRun deletes the scratch dir for id and returns the bytes it held.
-// A missing dir is not an error (the sweep, or an earlier call, got there).
+// A missing dir is an error wrapping fs.ErrNotExist (#2461): it may mean the
+// sweep or an earlier call got there, but it may also mean a wrong root, and
+// reporting that as a removal hides the scratch the caller meant to delete.
 func RemoveRun(root, id string) (int64, error) {
 	if err := ValidateID(id); err != nil {
 		return 0, err
 	}
 	dir := RunDir(root, id)
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, fmt.Errorf("no scratch dir for run %s under root %s: %w", id, root, fs.ErrNotExist)
+		}
+		return 0, err
+	}
+	if !fi.IsDir() {
+		return 0, fmt.Errorf("%s is not a directory", dir)
+	}
 	n, _ := DirBytes(dir)
 	if err := os.RemoveAll(dir); err != nil {
 		return 0, err
 	}
 	return n, nil
 }
+
+// FindRun returns the dirs <base>/<sub>/run-<id> that exist, for each
+// immediate subdir <sub> of base other than a 00-ff native entry dir. It is
+// how -remove-id points at the root a run actually used when the root it was
+// given holds nothing: the usual in-cache root is a subdir of $GOCACHE
+// (e.g. $GOCACHE/overlay). It never removes anything.
+func FindRun(base, id string) []string {
+	if base == "" || ValidateID(id) != nil {
+		return nil
+	}
+	ents, err := os.ReadDir(base)
+	if err != nil {
+		return nil
+	}
+	var found []string
+	for _, de := range ents {
+		if !de.IsDir() || nativeEntryDir.MatchString(de.Name()) {
+			continue
+		}
+		dir := RunDir(filepath.Join(base, de.Name()), id)
+		if fi, err := os.Lstat(dir); err == nil && fi.IsDir() {
+			found = append(found, dir)
+		}
+	}
+	return found
+}
+
+var nativeEntryDir = regexp.MustCompile(`^[0-9a-f]{2}$`)
 
 // DirBytes sums the sizes of regular files under dir.
 func DirBytes(dir string) (int64, error) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -210,8 +211,10 @@ func TestSweepAndRemoveRun(t *testing.T) {
 	if _, err := os.Stat(fresh); !os.IsNotExist(err) {
 		t.Fatalf("run dir still there: %v", err)
 	}
-	if _, err := RemoveRun(root, "fresh-run"); err != nil {
-		t.Fatalf("second remove: %v", err)
+	// #2461: a missing run dir is an error, so a wrong root is not reported
+	// as a successful removal.
+	if _, err := RemoveRun(root, "fresh-run"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("second remove: got %v, want an fs.ErrNotExist error", err)
 	}
 	for _, bad := range []string{"", "..", "../x", "a/b", ".hidden"} {
 		if _, err := RemoveRun(root, bad); err == nil {

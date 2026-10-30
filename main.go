@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -40,7 +41,8 @@ scratch dir. The shared cache is never written.
 Scratch dirs live under the scratch root:
   without a run id: <root>/inv-<pid>-*, removed when the go command exits
   with a run id:    <root>/run-<id>, shared by every go command carrying the
-                    id, removed by 'gocache-overlay -remove-id <id>'
+                    id, removed by 'gocache-overlay -remove-id <id>' (pass
+                    the same root; a root without the dir exits 1)
 Every start also removes scratch dirs untouched for longer than -max-age.
 The root may be a subdir of the shared dir (not a 00-ff entry dir), e.g.
 $GOCACHE/overlay: go then copies the scratch files it installs, and whatever
@@ -129,6 +131,18 @@ func run() int {
 
 	if *removeID != "" {
 		n, err := overlay.RemoveRun(*root, *removeID)
+		if errors.Is(err, fs.ErrNotExist) {
+			// #2461: say where the run's scratch is, if it is somewhere we
+			// know to look, rather than let a wrong root pass as a removal.
+			if others := otherRunDirs(*root, *removeID, *shared); len(others) > 0 {
+				hint := ""
+				for _, d := range others {
+					hint += fmt.Sprintf("\n  found %s: rerun with -root %s", d, filepath.Dir(d))
+				}
+				return fatal("%v; nothing removed%s", err, hint)
+			}
+			return fatal("%v; nothing removed (set -root or $GOCACHE_OVERLAY_ROOT to the root the run used)", err)
+		}
 		if err != nil {
 			return fatal("%v", err)
 		}
@@ -228,6 +242,30 @@ func serve(srv *overlay.Server, lazy *lock.Lazy, statsFile string, verbose bool,
 		return fatal("%v", serveErr)
 	}
 	return 0
+}
+
+// otherRunDirs lists existing scratch dirs for run id under roots other than
+// root: the default root, and the immediate subdirs of the shared dir (the
+// usual in-cache root, e.g. $GOCACHE/overlay).
+func otherRunDirs(root, id, shared string) []string {
+	cands := []string{overlay.RunDir(defaultRoot(), id)}
+	if filepath.IsAbs(shared) {
+		cands = append(cands, overlay.FindRun(filepath.Clean(shared), id)...)
+	}
+	skip := filepath.Clean(overlay.RunDir(root, id))
+	seen := map[string]bool{skip: true}
+	var found []string
+	for _, d := range cands {
+		d = filepath.Clean(d)
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
+		if fi, err := os.Lstat(d); err == nil && fi.IsDir() {
+			found = append(found, d)
+		}
+	}
+	return found
 }
 
 // umask returns the process umask (the go command's own files use 0666 less it).
